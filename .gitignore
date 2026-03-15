@@ -1,0 +1,27 @@
+# secrets
+.env
+
+# database
+code_memory.db
+
+# python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# model cache (downloaded at runtime)
+# faster-whisper caches to %USERPROFILE%\.cache\huggingface by default
+
+# editor
+.vscode/
+.idea/
+*.swp
+
+# windows
+Thumbs.db
+desktop.ini
