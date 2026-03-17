@@ -25,3 +25,6 @@ build/
 # windows
 Thumbs.db
 desktop.ini
+
+# Hindsight memory banks (stored centrally at E:\Programming\Hindsight\banks\)
+banks/
