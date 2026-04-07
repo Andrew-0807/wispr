@@ -38,41 +38,16 @@ _BENCH_MODE = "--bench" in sys.argv
 if not _BENCH_MODE and _check_single_instance():
     sys.exit("Wispr is already running. Exiting.")
 
+# ── Stdlib-only imports at module level (fast) ────────────────────────────────
 import re
 import json
 import time
 import threading
 import queue
 import asyncio
-import numpy as np
-import sounddevice as sd
-import pyautogui
-import pyperclip
-import keyboard
-import tkinter as tk
-from PIL import Image, ImageDraw, ImageTk
-from pystray import Icon, MenuItem, Menu
-from dotenv import load_dotenv
-import requests
 
-try:
-    from winrt.windows.media.control import (
-        GlobalSystemMediaTransportControlsSessionManager as MediaManager,
-    )
-
-    _media_controls_available = True
-except Exception:
-    MediaManager = None
-    _media_controls_available = False
-
-
-def _release_single_instance():
-    lock_file = os.path.join(tempfile.gettempdir(), "wispr.lock")
-    try:
-        os.remove(lock_file)
-    except OSError:
-        pass
-
+# Heavy third-party imports are deferred to main() below.
+# Module-level names used in type hints / global state use forward references.
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -122,24 +97,44 @@ SPINNER_R = 9  # radius of spinner circle
 SPINNER_DOT_R = 2  # radius of each spinner dot
 
 # rendering
-RENDER_SCALE = 4  # supersample factor — drawn at 4How are you doing?× then LANCZOS ↓
+RENDER_SCALE = 4  # supersample factor — drawn at 4× then LANCZOS ↓
 
 COLOR_REC = "#818cf8"  # indigo-400  – recording
 COLOR_PROC = "#fb923c"  # orange      – processing
 
-pyautogui.FAILSAFE = False
-pyautogui.PAUSE = 0
+# ── Global state (populated after deferred imports in main()) ─────────────────
 
-# ── Init ──────────────────────────────────────────────────────────────────────
+recording = False
+audio_chunks: list = []
+audio_level = 0.0
+tray_icon = None  # pystray.Icon — set in main()
+_paused_media_sessions: list = []
 
-load_dotenv()
+status_queue: queue.Queue = queue.Queue()  # "idle" | "recording" | "processing"
 
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()
-LLM_FALLBACK = os.getenv("LLM_FALLBACK", "").lower()
-CLEANUP_MODE = os.getenv(
-    "CLEANUP_MODE", "punct"
-).lower()  # "punct" = local only, "llm" = use LLM
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", OPENROUTER_DEFAULT)
+# Deferred import handles (set in main())
+np = None          # numpy
+sd = None          # sounddevice
+pyautogui = None
+pyperclip = None
+keyboard = None
+_PIL_Image = None
+_PIL_ImageDraw = None
+_PIL_ImageTk = None
+_pystray_Icon = None
+_pystray_MenuItem = None
+_pystray_Menu = None
+_http = None       # requests.Session
+
+MediaManager = None
+_media_controls_available = False
+
+# ── Env / provider state ──────────────────────────────────────────────────────
+
+LLM_PROVIDER = "gemini"     # overwritten after load_dotenv() in main()
+LLM_FALLBACK = ""
+CLEANUP_MODE = "punct"
+OPENROUTER_MODEL = OPENROUTER_DEFAULT
 
 gemini_client = None
 openrouter_api_key = ""
@@ -147,6 +142,14 @@ lmstudio_url = ""
 lmstudio_model = ""
 ollama_url = ""
 ollama_model = ""
+
+
+def _release_single_instance():
+    lock_file = os.path.join(tempfile.gettempdir(), "wispr.lock")
+    try:
+        os.remove(lock_file)
+    except OSError:
+        pass
 
 
 def _setup_provider(name: str, fatal: bool = True) -> bool:
@@ -204,9 +207,9 @@ def _setup_provider(name: str, fatal: bool = True) -> bool:
     )
 
 
-whisper = None  # loaded in background thread below
+whisper = None  # loaded in background thread
 whisper_ready = threading.Event()
-whisper_error: Exception | None = None
+whisper_error = None
 
 # ── Word map ──────────────────────────────────────────────────────────────────
 
@@ -230,55 +233,29 @@ def _apply_word_map(text: str, wmap: dict) -> str:
 
 WORD_MAP = _load_word_map()
 
-# ── Global state ──────────────────────────────────────────────────────────────
-
-recording = False
-audio_chunks: list = []
-audio_level = 0.0
-tray_icon: Icon | None = None
-_paused_media_sessions: list = []
-
-status_queue: queue.Queue[str] = queue.Queue()  # "idle" | "recording" | "processing"
-
 # ── Tray helpers ──────────────────────────────────────────────────────────────
 
+ICON_IDLE = None
+ICON_RECORDING = None
+ICON_PROCESSING = None
 
-def _make_mic_icon(color: str) -> Image.Image:
-    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
 
-    # Microphone body
+def _make_mic_icon(color: str):
+    img = _PIL_Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = _PIL_ImageDraw.Draw(img)
     draw.rounded_rectangle(
         [24, 8, 40, 36], radius=8, fill=color, outline="white", width=2
     )
-
-    # Grille lines
     for y in [16, 20, 24, 28]:
         draw.line([(28, y), (36, y)], fill="white", width=2)
-
-    # U-shaped stand
     draw.arc([18, 32, 46, 52], 180, 0, fill="white", width=2)
-
-    # Stem
     draw.line([(32, 44), (32, 50)], fill="white", width=2)
-
-    # Base
     draw.line([(24, 50), (40, 50)], fill="white", width=2)
-
-    # Sound waves (left)
     draw.arc([10, 18, 22, 36], 270, 90, fill="white", width=2)
     draw.arc([4, 12, 22, 42], 270, 90, fill="white", width=2)
-
-    # Sound waves (right)
     draw.arc([42, 18, 54, 36], 90, 270, fill="white", width=2)
     draw.arc([42, 12, 60, 42], 90, 270, fill="white", width=2)
-
     return img
-
-
-ICON_IDLE = _make_mic_icon("#22c55e")
-ICON_RECORDING = _make_mic_icon("#ef4444")
-ICON_PROCESSING = _make_mic_icon("#f59e0b")
 
 
 def _update_tray(state: str):
@@ -298,7 +275,7 @@ def _update_tray(state: str):
 # ── Audio callback ────────────────────────────────────────────────────────────
 
 
-def audio_callback(indata: np.ndarray, frames: int, time_info, status):
+def audio_callback(indata, frames: int, time_info, status):
     global audio_level
     if recording:
         audio_chunks.append(indata.copy())
@@ -307,14 +284,11 @@ def audio_callback(indata: np.ndarray, frames: int, time_info, status):
 
 # ── LLM cleanup ───────────────────────────────────────────────────────────────
 
-_http = requests.Session()
-_http.mount("http://", requests.adapters.HTTPAdapter(max_retries=0))
-_http.mount("https://", requests.adapters.HTTPAdapter(max_retries=0))
-
 
 def _openai_compat_cleanup(
     base_url: str, model: str, raw: str, api_key: str = ""
 ) -> str:
+    import requests as _req
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -328,7 +302,7 @@ def _openai_compat_cleanup(
                 {"role": "user", "content": raw},
             ],
         },
-        timeout=(1, 30),  # (connect, read) — fail instantly if server is down
+        timeout=(1, 30),
     )
     resp.raise_for_status()
     return resp.json()["choices"][0]["message"]["content"].strip()
@@ -360,11 +334,12 @@ def _local_punct(text: str) -> str:
 
 
 def cleanup_text(raw: str) -> str:
+    import requests as _req
     if CLEANUP_MODE == "punct":
         return _local_punct(raw)
     try:
         return _call_provider(LLM_PROVIDER, raw)
-    except (requests.ConnectionError, requests.Timeout):
+    except (_req.ConnectionError, _req.Timeout):
         if LLM_FALLBACK:
             print(f"  [{LLM_PROVIDER} unreachable → {LLM_FALLBACK}]")
             return _call_provider(LLM_FALLBACK, raw)
@@ -374,7 +349,7 @@ def cleanup_text(raw: str) -> str:
 # ── Transcription + cleanup ────────────────────────────────────────────────────
 
 
-def transcribe_and_paste(audio: np.ndarray):
+def transcribe_and_paste(audio):
     t_start = time.perf_counter()
     status_queue.put("processing")
 
@@ -505,7 +480,7 @@ _ctrl_down = False
 _combo_active = False
 
 
-def _on_key_event(event: keyboard.KeyboardEvent):
+def _on_key_event(event):
     global _win_down, _ctrl_down, _combo_active
     is_down = event.event_type == keyboard.KEY_DOWN
     name = (event.name or "").lower()
@@ -532,15 +507,15 @@ class Overlay:
     _PROC_RGBA = tuple(int(COLOR_PROC[i : i + 2], 16) for i in (1, 3, 5)) + (255,)
 
     def __init__(self):
+        import tkinter as tk
         self._rng = np.random.default_rng()
         self._dot_h = [float(DOT_R)] * NUM_DOTS
-        # Cosine envelope: 1.0 at center, 0.25 at edges → pill-within-pill silhouette
         _pos = np.linspace(-np.pi / 2, np.pi / 2, NUM_DOTS)
         self._dot_env = 0.25 + 0.75 * np.cos(_pos) ** 2
         self._spinner_angle = 0.0
         self._mode = "idle"
-        self._t_frac = 1.0  # cross-fade progress (0=start of processing, 1=done)
-        self._frame_ref = None  # prevent PhotoImage GC
+        self._t_frac = 1.0
+        self._frame_ref = None
 
         root = tk.Tk()
         root.title("wispr-overlay")
@@ -560,8 +535,8 @@ class Overlay:
         x = (sw - OVERLAY_W) // 2
         self._x = x
         self._target_y = sh - OVERLAY_H - TASKBAR_CLEAR
-        self._sh = sh  # off-screen bottom anchor
-        self._y = float(sh)  # current animated y (starts off-screen)
+        self._sh = sh
+        self._y = float(sh)
         self._anim_token = 0
         self._visible = False
         ov.geometry(f"{OVERLAY_W}x{OVERLAY_H}+{x}+{sh}")
@@ -571,22 +546,16 @@ class Overlay:
         )
         c.pack()
 
-        # Single image item — the full frame is re-rendered each tick via PIL
         self._frame_item = c.create_image(0, 0, anchor="nw")
 
-        # ── Pre-computed layers (drawn once) ──────────────────────────────────
-        # Solid key-color background layer
-        self._bg_layer = Image.new("RGBA", (OVERLAY_W, OVERLAY_H), self._KEY_RGBA)
-
-        # Pill shape layer (transparent outside, PILL_FILL inside)
-        self._pill_layer = Image.new("RGBA", (OVERLAY_W, OVERLAY_H), (0, 0, 0, 0))
-        ImageDraw.Draw(self._pill_layer).rounded_rectangle(
+        self._bg_layer = _PIL_Image.new("RGBA", (OVERLAY_W, OVERLAY_H), self._KEY_RGBA)
+        self._pill_layer = _PIL_Image.new("RGBA", (OVERLAY_W, OVERLAY_H), (0, 0, 0, 0))
+        _PIL_ImageDraw.Draw(self._pill_layer).rounded_rectangle(
             [0, 0, OVERLAY_W - 1, OVERLAY_H - 1],
             radius=OVERLAY_H // 2,
             fill=PILL_FILL,
         )
 
-        # ── Logical dot positions (x centres) ────────────────────────────────
         total_dot_w = NUM_DOTS * DOT_R * 2 + (NUM_DOTS - 1) * DOT_GAP
         dot_x0 = (OVERLAY_W - total_dot_w) // 2
         mid_y = OVERLAY_H // 2
@@ -603,11 +572,8 @@ class Overlay:
         self._tick()
         self._poll()
 
-    # ── PIL frame renderer ────────────────────────────────────────────────────
-
     @staticmethod
     def _spinner_rgba(frac: float) -> tuple:
-        """Fade bright orange → near-black across the spinner tail."""
         return (
             int(0xFB * (1 - frac) + 0x20 * frac),
             int(0x92 * (1 - frac) + 0x10 * frac),
@@ -615,13 +581,12 @@ class Overlay:
             255,
         )
 
-    def _render_frame(self) -> ImageTk.PhotoImage:
+    def _render_frame(self):
         S = RENDER_SCALE
         W3, H3 = OVERLAY_W * S, OVERLAY_H * S
 
-        # Draw content at 3× resolution on a transparent canvas
-        content = Image.new("RGBA", (W3, H3), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(content)
+        content = _PIL_Image.new("RGBA", (W3, H3), (0, 0, 0, 0))
+        draw = _PIL_ImageDraw.Draw(content)
 
         if self._mode == "recording":
             for i, cx in enumerate(self._dot_xs):
@@ -633,7 +598,6 @@ class Overlay:
 
         elif self._mode == "processing":
             spin_a = int(255 * self._t_frac)
-            # Spinner fades in
             for j in range(SPINNER_DOTS):
                 a = self._spinner_angle + j * (2 * np.pi / SPINNER_DOTS)
                 px = self._spin_cx * S + np.cos(a) * SPINNER_R * S
@@ -643,7 +607,6 @@ class Overlay:
                 draw.ellipse(
                     [px - r, py - r, px + r, py + r], fill=base[:3] + (spin_a,)
                 )
-            # Dots fade out during transition
             if self._t_frac < 1.0:
                 dot_a = int(255 * (1.0 - self._t_frac))
                 for i, cx in enumerate(self._dot_xs):
@@ -656,15 +619,10 @@ class Overlay:
                         fill=self._REC_RGBA[:3] + (dot_a,),
                     )
 
-        # Downscale 3× → 1× with LANCZOS (anti-aliased smooth circles)
-        content = content.resize((OVERLAY_W, OVERLAY_H), Image.LANCZOS)
-
-        # Composite: key-color bg → pill shape → animated content
-        frame = Image.alpha_composite(self._bg_layer, self._pill_layer)
-        frame = Image.alpha_composite(frame, content)
-        return ImageTk.PhotoImage(frame.convert("RGB"))
-
-    # ── animation tick ────────────────────────────────────────────────────────
+        content = content.resize((OVERLAY_W, OVERLAY_H), _PIL_Image.LANCZOS)
+        frame = _PIL_Image.alpha_composite(self._bg_layer, self._pill_layer)
+        frame = _PIL_Image.alpha_composite(frame, content)
+        return _PIL_ImageTk.PhotoImage(frame.convert("RGB"))
 
     def _tick(self):
         if self._mode == "recording":
@@ -678,7 +636,7 @@ class Overlay:
         elif self._mode == "processing":
             self._spinner_angle -= 0.30
             if self._t_frac < 1.0:
-                self._t_frac = min(1.0, self._t_frac + 0.14)  # ~350 ms
+                self._t_frac = min(1.0, self._t_frac + 0.14)
                 for i in range(NUM_DOTS):
                     self._dot_h[i] += (DOT_R - self._dot_h[i]) * 0.45
 
@@ -688,12 +646,10 @@ class Overlay:
 
         if self._mode != "idle":
             photo = self._render_frame()
-            self._frame_ref = photo  # hold reference — prevents GC
+            self._frame_ref = photo
             self._canvas.itemconfig(self._frame_item, image=photo)
 
         self.root.after(50, self._tick)
-
-    # ── status polling ────────────────────────────────────────────────────────
 
     def _poll(self):
         try:
@@ -703,11 +659,9 @@ class Overlay:
             pass
         self.root.after(50, self._poll)
 
-    # ── slide animation ───────────────────────────────────────────────────────
-
     def _animate_to(self, target_y: int, token: int, on_done=None):
         if self._anim_token != token:
-            return  # superseded by a newer animation
+            return
         dist = target_y - self._y
         if abs(dist) < 0.8:
             self._y = float(target_y)
@@ -715,7 +669,7 @@ class Overlay:
             if on_done:
                 on_done()
             return
-        self._y += dist * 0.28  # exponential ease-out
+        self._y += dist * 0.28
         self._ov.geometry(f"{OVERLAY_W}x{OVERLAY_H}+{self._x}+{int(self._y)}")
         self.root.after(16, lambda: self._animate_to(target_y, token, on_done))
 
@@ -726,7 +680,7 @@ class Overlay:
 
         if state in ("recording", "processing"):
             if state == "processing":
-                self._t_frac = 0.0  # kick off cross-fade
+                self._t_frac = 0.0
             if not self._visible:
                 self._visible = True
                 self._y = float(self._sh)
@@ -750,7 +704,7 @@ class Overlay:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 
-def _quit(icon: Icon, item):
+def _quit(icon, item):
     icon.stop()
     os._exit(0)
 
@@ -758,26 +712,25 @@ def _quit(icon: Icon, item):
 _PROVIDERS = ["gemini", "openrouter", "ollama", "lmstudio"]
 
 
-def _toggle_llm(icon: Icon, item):
+def _toggle_llm(icon, item):
     global CLEANUP_MODE
     CLEANUP_MODE = "llm" if CLEANUP_MODE == "punct" else "punct"
     icon.update_menu()
 
 
 def _set_provider(name: str):
-    def _handler(icon: Icon, item):
+    def _handler(icon, item):
         global LLM_PROVIDER
         ok = _setup_provider(name, fatal=False)
         if ok:
             LLM_PROVIDER = name
         icon.update_menu()
-
     return _handler
 
 
-def _build_menu() -> Menu:
+def _build_menu():
     provider_items = [
-        MenuItem(
+        _pystray_MenuItem(
             p,
             _set_provider(p),
             checked=lambda item, p=p: LLM_PROVIDER == p,
@@ -785,15 +738,15 @@ def _build_menu() -> Menu:
         )
         for p in _PROVIDERS
     ]
-    return Menu(
-        MenuItem(
+    return _pystray_Menu(
+        _pystray_MenuItem(
             lambda item: f"LLM Correction: {'ON' if CLEANUP_MODE == 'llm' else 'OFF'}",
             _toggle_llm,
             checked=lambda item: CLEANUP_MODE == "llm",
         ),
-        MenuItem("Provider", Menu(*provider_items)),
-        Menu.SEPARATOR,
-        MenuItem("Quit Wispr", _quit),
+        _pystray_MenuItem("Provider", _pystray_Menu(*provider_items)),
+        _pystray_Menu.SEPARATOR,
+        _pystray_MenuItem("Quit Wispr", _quit),
     )
 
 
@@ -830,10 +783,72 @@ def _load_whisper():
 
 
 def main():
-    global tray_icon
+    global tray_icon, np, sd, pyautogui, pyperclip, keyboard
+    global _PIL_Image, _PIL_ImageDraw, _PIL_ImageTk
+    global _pystray_Icon, _pystray_MenuItem, _pystray_Menu
+    global _http, MediaManager, _media_controls_available
+    global LLM_PROVIDER, LLM_FALLBACK, CLEANUP_MODE, OPENROUTER_MODEL
+    global ICON_IDLE, ICON_RECORDING, ICON_PROCESSING
 
     _t_main_start = time.perf_counter()
 
+    # ── Deferred heavy imports ────────────────────────────────────────────────
+    import numpy as _np
+    np = _np
+
+    import sounddevice as _sd
+    sd = _sd
+
+    import pyautogui as _pyautogui
+    pyautogui = _pyautogui
+    pyautogui.FAILSAFE = False
+    pyautogui.PAUSE = 0
+
+    import pyperclip as _pyperclip
+    pyperclip = _pyperclip
+
+    import keyboard as _keyboard
+    keyboard = _keyboard
+
+    from PIL import Image as _Image, ImageDraw as _ImageDraw, ImageTk as _ImageTk
+    _PIL_Image = _Image
+    _PIL_ImageDraw = _ImageDraw
+    _PIL_ImageTk = _ImageTk
+
+    from pystray import Icon as _Icon, MenuItem as _MenuItem, Menu as _Menu
+    _pystray_Icon = _Icon
+    _pystray_MenuItem = _MenuItem
+    _pystray_Menu = _Menu
+
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()
+    LLM_FALLBACK = os.getenv("LLM_FALLBACK", "").lower()
+    CLEANUP_MODE = os.getenv("CLEANUP_MODE", "punct").lower()
+    OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", OPENROUTER_DEFAULT)
+
+    import requests as _requests
+    _http = _requests.Session()
+    _http.mount("http://", _requests.adapters.HTTPAdapter(max_retries=0))
+    _http.mount("https://", _requests.adapters.HTTPAdapter(max_retries=0))
+
+    try:
+        from winrt.windows.media.control import (
+            GlobalSystemMediaTransportControlsSessionManager as _MediaManager,
+        )
+        MediaManager = _MediaManager
+        _media_controls_available = True
+    except Exception:
+        MediaManager = None
+        _media_controls_available = False
+
+    # ── Build tray icons (deferred from module level) ─────────────────────────
+    ICON_IDLE = _make_mic_icon("#22c55e")
+    ICON_RECORDING = _make_mic_icon("#ef4444")
+    ICON_PROCESSING = _make_mic_icon("#f59e0b")
+
+    # ── LLM provider setup ────────────────────────────────────────────────────
     if not _BENCH_MODE:
         if LLM_PROVIDER != "punct":
             _setup_provider(LLM_PROVIDER, fatal=True)
@@ -853,7 +868,7 @@ def main():
 
     keyboard.hook(_on_key_event)
 
-    tray_icon = Icon(
+    tray_icon = _pystray_Icon(
         "Wispr",
         ICON_IDLE,
         "Wispr – Idle (hold the Wispr hotkey to record)",
@@ -864,8 +879,7 @@ def main():
     if _BENCH_MODE:
         _t_interactive = time.perf_counter()
         _elapsed_ms = (_t_interactive - _t_main_start) * 1000
-        import tempfile as _tf
-        _bench_file = os.path.join(_tf.gettempdir(), "wispr_bench.txt")
+        _bench_file = os.path.join(tempfile.gettempdir(), "wispr_bench.txt")
         with open(_bench_file, "w") as _f:
             _f.write(f"{_elapsed_ms:.1f}")
         print(f"[BENCH] interactive in {_elapsed_ms:.1f}ms (main() only)")
