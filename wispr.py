@@ -884,14 +884,23 @@ def main():
 
     threading.Thread(target=_load_whisper, daemon=True).start()
 
-    stream = sd.InputStream(
-        samplerate=SAMPLE_RATE,
-        channels=CHANNELS,
-        dtype="float32",
-        callback=audio_callback,
-        blocksize=1024,
-    )
-    stream.start()
+    # Start stream init in background — overlaps with tray/keyboard setup
+    _stream_container = [None]
+    _stream_ready = threading.Event()
+
+    def _init_stream():
+        s = sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=CHANNELS,
+            dtype="float32",
+            callback=audio_callback,
+            blocksize=1024,
+        )
+        s.start()
+        _stream_container[0] = s
+        _stream_ready.set()
+
+    threading.Thread(target=_init_stream, daemon=True).start()
 
     keyboard.hook(_on_key_event)
 
@@ -902,6 +911,10 @@ def main():
         _build_menu(),
     )
     threading.Thread(target=tray_icon.run, daemon=True).start()
+
+    # Ensure stream is ready before proceeding
+    _stream_ready.wait(timeout=10)
+    stream = _stream_container[0]
 
     if _BENCH_MODE:
         _t_interactive = time.perf_counter()
