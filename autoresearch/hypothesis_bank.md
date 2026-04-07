@@ -2,50 +2,42 @@
 
 Priority order (highest impact first):
 
-## H1 [HIGH] Add --bench flag + lazy imports for sounddevice, keyboard, pystray, PIL
-Move heavy imports inside main() so they only load when main() is called, not at module level.
-Also add the --bench flag infrastructure.
-Expected gain: 30-50% (PIL + sounddevice are the heaviest imports)
+## Remaining / Not Yet Tried
 
-## H2 [HIGH] Lazy icon creation
-Move ICON_IDLE/RECORDING/PROCESSING from module-level to inside main() or _build_menu().
-Currently drawn at import time via 3x _make_mic_icon() calls.
-Expected gain: 5-15%
+## H-NEW-1 [HIGH] Replace `keyboard` library with `pynput` for hook
+`keyboard` library hook takes 167ms on main thread. `pynput` uses a different
+Windows API path and may be faster. Would need to rewrite _on_key_event logic.
+Expected gain: 50-150ms
 
-## H3 [HIGH] Defer sounddevice stream init to background thread
-sd.InputStream() + start() blocks; move to a background thread that starts immediately.
-Expected gain: 100-300ms depending on audio driver init
+## H-NEW-2 [HIGH] Pre-warm Python bytecache via subprocess
+Launch a short warm-up script that pre-imports all heavy packages and exits,
+so .pyc files are in OS file cache on next run. Only helps on cold start.
+Expected gain: 100-300ms on cold start, 0 on warm start
 
-## H4 [MEDIUM] Defer winrt import with importlib
-Use importlib.import_module() inside a try block instead of top-level import.
-Expected gain: 5-20ms (winrt COM init)
-
-## H5 [MEDIUM] Defer requests.Session() creation
-The _http Session and adapter mounts happen at module level. Move inside a function.
-Expected gain: 5-10ms
-
-## H6 [MEDIUM] Parallelize icon creation + stream init with ThreadPoolExecutor
-Both can run concurrently — icon creation (PIL) and sd.InputStream() init.
-Expected gain: 20-50ms
-
-## H7 [MEDIUM] Defer load_dotenv() + env var reads to inside main()
-load_dotenv() does disk I/O. Move it inside main().
-Expected gain: 5-15ms
-
-## H8 [LOW] Use importlib lazy loader for rarely-used modules
-Wrap tkinter, pyautogui, pyperclip in lazy import proxies.
+## H-NEW-3 [MEDIUM] Reduce sounddevice blocksize to speed up stream init
+Larger blocksize = longer first-buffer wait. Try blocksize=256 instead of 1024.
 Expected gain: 10-30ms
 
-## H9 [LOW] Pre-compile regex patterns at module level
-_apply_word_map re.sub calls compile regex each time — move to cached patterns.
-Expected gain: negligible at startup (only matters at transcription time)
+## H-NEW-4 [MEDIUM] Combine keyboard.hook + stream init in a single thread sequence
+Since keyboard.hook takes 167ms and stream takes ~165ms (both sequential now),
+try: start stream thread first, then do keyboard.hook on main, then wait for both.
+This is the current exp4 approach. Already done — verify nothing further to overlap.
 
-## H10 [LOW] Skip _setup_provider entirely in bench mode
-In --bench mode, skip LLM provider setup since it's not needed.
-Expected gain: 5-10ms
+## H-NEW-5 [LOW] Use importlib.import_module with __import__ cache check
+Before spawning thread for each package, check sys.modules first to skip
+already-imported packages on hot restart.
+Expected gain: negligible in cold start
 
-## Completed
-(none yet)
+## Completed (kept)
+- H1: lazy imports → exp1 (keep, -21.7%)
+- H3: parallel imports → exp3 (keep, -23.8%)
+- H4: background stream init → exp4 (keep, -27.2%)
 
 ## Discarded
-(none yet)
+- H2 (exp2): parallel numpy → circular import crash
+- H5 (exp5): background tray icon → threading overhead > savings
+- H6/exp6: skip load_dotenv in bench mode → branching overhead > savings
+- H7/exp7: skip icon render in bench mode → PIL already loaded
+- H8/exp8: skip 3 parallel imports in bench mode → bottleneck is slowest, not count
+- H9/exp9: background keyboard.hook → Windows hook must be on main thread (+196ms)
+- H10/exp10: defer WORD_MAP to parallel pool → disk I/O negligible
