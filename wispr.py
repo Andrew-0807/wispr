@@ -793,55 +793,82 @@ def main():
     _t_main_start = time.perf_counter()
 
     # ── Deferred heavy imports ────────────────────────────────────────────────
+    # numpy must be imported single-threaded (circular import risk in threads).
+    # All other packages are independent and safe to import in parallel.
     import numpy as _np
     np = _np
 
-    import sounddevice as _sd
-    sd = _sd
+    import concurrent.futures as _cf
 
-    import pyautogui as _pyautogui
-    pyautogui = _pyautogui
+    def _import_sounddevice():
+        import sounddevice as _sd
+        return _sd
+
+    def _import_pyautogui():
+        import pyautogui as _pag
+        return _pag
+
+    def _import_pyperclip():
+        import pyperclip as _pc
+        return _pc
+
+    def _import_keyboard():
+        import keyboard as _kb
+        return _kb
+
+    def _import_pil():
+        from PIL import Image as _Im, ImageDraw as _ID, ImageTk as _ITk
+        return _Im, _ID, _ITk
+
+    def _import_pystray():
+        from pystray import Icon as _Ic, MenuItem as _MI, Menu as _Me
+        return _Ic, _MI, _Me
+
+    def _import_requests_dotenv():
+        import requests as _req
+        from dotenv import load_dotenv as _ld
+        return _req, _ld
+
+    def _import_winrt():
+        try:
+            from winrt.windows.media.control import (
+                GlobalSystemMediaTransportControlsSessionManager as _MM,
+            )
+            return _MM, True
+        except Exception:
+            return None, False
+
+    with _cf.ThreadPoolExecutor(max_workers=8) as _pool:
+        _f_sd  = _pool.submit(_import_sounddevice)
+        _f_pag = _pool.submit(_import_pyautogui)
+        _f_pc  = _pool.submit(_import_pyperclip)
+        _f_kb  = _pool.submit(_import_keyboard)
+        _f_pil = _pool.submit(_import_pil)
+        _f_pst = _pool.submit(_import_pystray)
+        _f_rd  = _pool.submit(_import_requests_dotenv)
+        _f_wrt = _pool.submit(_import_winrt)
+
+        sd                        = _f_sd.result()
+        pyautogui                 = _f_pag.result()
+        pyperclip                 = _f_pc.result()
+        keyboard                  = _f_kb.result()
+        _PIL_Image, _PIL_ImageDraw, _PIL_ImageTk = _f_pil.result()
+        _pystray_Icon, _pystray_MenuItem, _pystray_Menu = _f_pst.result()
+        _requests, load_dotenv    = _f_rd.result()
+        MediaManager, _media_controls_available = _f_wrt.result()
+
     pyautogui.FAILSAFE = False
     pyautogui.PAUSE = 0
 
-    import pyperclip as _pyperclip
-    pyperclip = _pyperclip
-
-    import keyboard as _keyboard
-    keyboard = _keyboard
-
-    from PIL import Image as _Image, ImageDraw as _ImageDraw, ImageTk as _ImageTk
-    _PIL_Image = _Image
-    _PIL_ImageDraw = _ImageDraw
-    _PIL_ImageTk = _ImageTk
-
-    from pystray import Icon as _Icon, MenuItem as _MenuItem, Menu as _Menu
-    _pystray_Icon = _Icon
-    _pystray_MenuItem = _MenuItem
-    _pystray_Menu = _Menu
-
-    from dotenv import load_dotenv
     load_dotenv()
-
     LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()
     LLM_FALLBACK = os.getenv("LLM_FALLBACK", "").lower()
     CLEANUP_MODE = os.getenv("CLEANUP_MODE", "punct").lower()
     OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", OPENROUTER_DEFAULT)
 
-    import requests as _requests
     _http = _requests.Session()
     _http.mount("http://", _requests.adapters.HTTPAdapter(max_retries=0))
     _http.mount("https://", _requests.adapters.HTTPAdapter(max_retries=0))
-
-    try:
-        from winrt.windows.media.control import (
-            GlobalSystemMediaTransportControlsSessionManager as _MediaManager,
-        )
-        MediaManager = _MediaManager
-        _media_controls_available = True
-    except Exception:
-        MediaManager = None
-        _media_controls_available = False
 
     # ── Build tray icons (deferred from module level) ─────────────────────────
     ICON_IDLE = _make_mic_icon("#22c55e")
