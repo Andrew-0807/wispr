@@ -27,6 +27,7 @@ Wispr's goal is an ultra-lightweight (< 150 MB active RAM), push-to-talk voice d
 | Distil-Whisper medium.en | 394M | ~250 MB (Q5_0 GGUF) | ~280 - 350 MB | ~0.05 - 0.09 | ~180 - 260 ms | ~3.0% | No (English only) | `whisper-rs` / `candle` |
 | Distil-Whisper large-v3 | 756M | ~500 MB (Q4_0 GGUF) | ~550 - 700 MB | ~0.08 - 0.15 | ~240 - 350 ms | ~2.6% | English primary | `whisper-rs` / `candle` |
 | NVIDIA Parakeet-TDT 0.6B | 600M | ~380 MB (INT8 ONNX) | ~500 - 650 MB | ~0.03 - 0.06 | ~110 - 160 ms | ~2.1% (SOTA) | No (English only) | `sherpa-onnx` |
+| Phonon-2 (Fermion Research) | ~600M (distilled) | **164 MB** (2.1-bit QAT) | **~180 - 240 MB** | **~0.02 - 0.05** | **~80 - 130 ms** | **~5.2% (OpenASR)** | No (English only) | Custom C++/Wasm (`phonon-cpu`) |
 | NVIDIA Canary-1B | 1000M | ~700 MB (INT8 ONNX) | ~900 - 1200 MB | ~0.15 - 0.28 | ~450 - 700 ms | ~2.5% | Yes (EN, DE, ES, FR + 20 EU) | `sherpa-onnx` |
 
 Note: RTF = Real-Time Factor (Duration to process / Duration of audio). Values < 1.0 are faster than real time; 0.01 = 100x real-time.
@@ -61,7 +62,18 @@ Note: RTF = Real-Time Factor (Duration to process / Duration of audio). Values <
 * Core Edge Advantage: TDT predicts both the token and the number of audio frames to advance, allowing the decoder to skip multiple frames at once. It runs ~3x faster than standard conformer transducers and holds top ranking on OpenASR for English accuracy.
 * Limitation: Parakeet 0.6B and Canary 1B are heavy for an ultra-lightweight desktop background utility. They exceed Wispr < 150 MB RAM budget (Canary-1B requires ~1 GB RAM) and have complex multi-graph ONNX dependencies.
 
-### 5. Distil-Whisper (`distil-medium.en` / `distil-large-v3`)
+### 5. Phonon-2 (Fermion Research, often referenced as "Photon 2")
+* Architecture: Quantization-aware trained distillation of NVIDIA Parakeet TDT 0.6B v3.
+* Core Edge Advantage:
+  * Extreme Compression: 164 MB download (~177 MB on disk), compressing the 2.5 GB Parakeet teacher by ~15x.
+  * 2.1-Bit Learned Quantization: Uses 5-level learned weights with 6-bit lookup tables for fast CPU and Apple Silicon execution.
+  * Direct Punctuated Output: Directly outputs punctuation, truecasing, and word-level timestamps.
+  * Accuracy: Sits at ~5.21% average WER on OpenASR benchmarks, matching the accuracy of the full teacher model and rivaling Whisper Large on English.
+* Limitation for Wispr Rust:
+  * English only (no Romanian or multilingual support).
+  * Lacks an official native Rust crate. Currently distributed as Python (`fermion-research`), C++ Docker images (`phonon-cpu`), and community WebAssembly/WebGPU ports. Direct integration in Wispr Rust would require either wrapping `phonon-cpu` via FFI or running an internal localhost inference server.
+
+### 6. Distil-Whisper (`distil-medium.en` / `distil-large-v3`)
 * Architecture: Knowledge distillation with decoder pruned to 2 layers (from 24 or 32).
 * Core Edge Advantage: Preserves the Whisper vocabulary, prompt conditioning, and GGUF quantization format. Runs ~6x faster than Whisper large-v3 with negligible accuracy drop (< 1% WER difference).
 * Limitation: Still requires 30-second Mel spectrogram zero-padding. Superseded for multilingual use by OpenAI official `large-v3-turbo`.
