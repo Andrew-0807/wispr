@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <linearGradient id="bodyGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#c4c4d4"/>
+      <stop offset="100%" stop-color="#9090a8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Stand base -->
+  <line x1="20" y1="54" x2="44" y2="54" stroke="#7c8898" stroke-width="3" stroke-linecap="round"/>
+  <!-- Stand pole -->
+  <line x1="32" y1="44" x2="32" y2="54" stroke="#7c8898" stroke-width="3" stroke-linecap="round"/>
+  <!-- Stand arc -->
+  <path d="M 18 26 Q 18 44 32 44 Q 46 44 46 26" fill="none" stroke="#7c8898" stroke-width="3" stroke-linecap="round"/>
+  <!-- Mic body -->
+  <rect x="21" y="8" width="22" height="32" rx="11" fill="url(#bodyGrad)" stroke="#7c8898" stroke-width="2.5"/>
+  <!-- Grille lines -->
+  <line x1="26" y1="16" x2="38" y2="16" stroke="#585b70" stroke-width="1.5" stroke-linecap="round"/>
+  <line x1="26" y1="21" x2="38" y2="21" stroke="#585b70" stroke-width="1.5" stroke-linecap="round"/>
+  <line x1="26" y1="26" x2="38" y2="26" stroke="#585b70" stroke-width="1.5" stroke-linecap="round"/>
+  <line x1="26" y1="31" x2="38" y2="31" stroke="#585b70" stroke-width="1.5" stroke-linecap="round"/>
+</svg>

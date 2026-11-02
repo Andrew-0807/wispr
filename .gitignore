@@ -1,10 +1,13 @@
-# secrets
+# Environment & Secrets
 .env
+.env.*
+!.env.example
 
-# database
+# Memory & Local DB
 code_memory.db
+banks/
 
-# python
+# Python artifacts
 __pycache__/
 *.py[cod]
 *.pyo
@@ -13,29 +16,56 @@ venv/
 *.egg-info/
 dist/
 build/
+.pytest_cache/
+wispr.lock
 
-# model cache (downloaded at runtime)
-# faster-whisper caches to %USERPROFILE%\.cache\huggingface by default
+# Rust & Cargo build artifacts
+target/
+**/target/
+*.rs.bk
 
-# editor
+# Compiled binaries and executables
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+*.lib
+*.exp
+*.lnk
+wispr_py/Wispr/
+
+# Model weights & caches (downloaded separately / runtime)
+*.bin
+*.gguf
+*.onnx
+*.pt
+*.safetensors
+Wispr_rust/models/
+models/
+
+# Editor & OS files
 .vscode/
 .idea/
 *.swp
-
-# windows
+.DS_Store
 Thumbs.db
 desktop.ini
 
-# Hindsight memory banks (stored centrally at E:\Programming\Hindsight\banks\)
-banks/
+# Logs & scratch/temp files
+*.log
+nul
+tmp/
+wispr_py/tmp/
+autoresearch/run.log
 
-# Auto Claude data directory
+# Agent & local tool configs
+.claude/
 .auto-claude/
-
-# Auto Claude generated files
 .auto-claude-security.json
 .auto-claude-status
 .claude_settings.json
 .worktrees/
 .security-key
 logs/security/
+.mcp.json

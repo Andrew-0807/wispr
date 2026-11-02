@@ -9,6 +9,8 @@ Hold the Wispr hotkey to record, release to transcribe and paste.
 import os
 import sys
 import tempfile
+import subprocess
+import numpy as _np
 
 
 def _check_single_instance() -> bool:
@@ -44,7 +46,10 @@ import json
 import time
 import threading
 import queue
-import asyncio
+import math
+import atexit
+import urllib.request
+import urllib.error
 
 # Heavy third-party imports are deferred to main() below.
 # Module-level names used in type hints / global state use forward references.
@@ -54,6 +59,7 @@ import asyncio
 SAMPLE_RATE = 16_000
 CHANNELS = 1
 WHISPER_MODEL = "small.en"
+WHISPER_MODEL_RO = "large-v3-turbo"  # multilingual model for Romanian
 WHISPER_DEVICE = "cuda"
 WHISPER_COMPUTE = "float16"
 BEAM_SIZE = 1
@@ -108,13 +114,18 @@ recording = False
 audio_chunks: list = []
 audio_level = 0.0
 tray_icon = None  # pystray.Icon — set in main()
-_paused_media_sessions: list = []
+_media_was_paused = False
+_audio_stream = None
+_rec_lock = threading.Lock()
+_media_paused_event = threading.Event()
+_pasting = False
+_keyboard_hook_ref = None
 
 status_queue: queue.Queue = queue.Queue()  # "idle" | "recording" | "processing"
 
 # Deferred import handles (set in main())
-np = None          # numpy
-sd = None          # sounddevice
+np = None  # numpy
+sd = None  # sounddevice
 pyautogui = None
 pyperclip = None
 keyboard = None
@@ -124,14 +135,10 @@ _PIL_ImageTk = None
 _pystray_Icon = None
 _pystray_MenuItem = None
 _pystray_Menu = None
-_http = None       # requests.Session
-
-MediaManager = None
-_media_controls_available = False
 
 # ── Env / provider state ──────────────────────────────────────────────────────
 
-LLM_PROVIDER = "gemini"     # overwritten after load_dotenv() in main()
+LLM_PROVIDER = "gemini"  # overwritten after load_dotenv() in main()
 LLM_FALLBACK = ""
 CLEANUP_MODE = "punct"
 OPENROUTER_MODEL = OPENROUTER_DEFAULT
@@ -140,6 +147,7 @@ gemini_client = None
 openrouter_api_key = ""
 lmstudio_url = ""
 lmstudio_model = ""
+lmstudio_api_key = ""
 ollama_url = ""
 ollama_model = ""
 
@@ -152,12 +160,16 @@ def _release_single_instance():
         pass
 
 
+atexit.register(_release_single_instance)
+
+
 def _setup_provider(name: str, fatal: bool = True) -> bool:
     global \
         gemini_client, \
         openrouter_api_key, \
         lmstudio_url, \
         lmstudio_model, \
+        lmstudio_api_key, \
         ollama_url, \
         ollama_model
     label = "primary" if fatal else "fallback"
@@ -180,20 +192,18 @@ def _setup_provider(name: str, fatal: bool = True) -> bool:
         gemini_client = genai.GenerativeModel(
             model_name=GEMINI_MODEL, system_instruction=CLEANUP_SYSTEM
         )
-        print(f"LLM {label}: Gemini ({GEMINI_MODEL})")
         return True
 
     if name == "openrouter":
         openrouter_api_key = os.getenv("OPENROUTER_API_KEY", "")
         if not openrouter_api_key:
             return _fail("OPENROUTER_API_KEY not set in .env.")
-        print(f"LLM {label}: OpenRouter ({OPENROUTER_MODEL})")
         return True
 
     if name == "lmstudio":
         lmstudio_url = os.getenv("LMSTUDIO_URL", "http://localhost:1234/v1")
         lmstudio_model = os.getenv("LMSTUDIO_MODEL", LMSTUDIO_DEFAULT)
-        print(f"LLM {label}: LM Studio ({lmstudio_model} @ {lmstudio_url})")
+        lmstudio_api_key = os.getenv("LMSTUDIO_API_KEY", "")
         return True
 
     if name == "ollama":
@@ -210,6 +220,72 @@ def _setup_provider(name: str, fatal: bool = True) -> bool:
 whisper = None  # loaded in background thread
 whisper_ready = threading.Event()
 whisper_error = None
+
+whisper_ro = None  # Romanian model — loaded on first Shift+Win press
+whisper_ro_lock = threading.Lock()
+whisper_ro_loading = False
+
+
+def _cuda_gpu():
+    """Check for CUDA GPU via nvidia-smi. Returns GPU name or None."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def _ensure_whisper_ro():
+    """Load Romanian whisper model on first use. Returns model or None."""
+    global whisper_ro, whisper_ro_loading
+    if whisper_ro is not None:
+        return whisper_ro
+    with whisper_ro_lock:
+        if whisper_ro is not None:
+            return whisper_ro
+        if whisper_ro_loading:
+            return None
+        whisper_ro_loading = True
+    print("Loading Romanian model…")
+    from faster_whisper import WhisperModel
+
+    attempts = []
+    if _cuda_gpu():
+        attempts.append((WHISPER_DEVICE, WHISPER_COMPUTE))
+    attempts.append(("cpu", "int8"))
+
+    for device, compute_type in attempts:
+        try:
+            whisper_ro = WhisperModel(
+                WHISPER_MODEL_RO, device=device, compute_type=compute_type
+            )
+            print(f"Romanian model loaded on {device}")
+            whisper_ro_loading = False
+            return whisper_ro
+        except Exception as exc:
+            last_error = exc
+
+    print(f"ERROR: Romanian model failed to load: {last_error}")
+    whisper_ro_loading = False
+    return None
+
+
+def _unload_whisper_ro(icon=None, item=None):
+    """Unload Romanian model to free VRAM."""
+    global whisper_ro
+    if whisper_ro is None:
+        print("Romanian model not loaded.")
+        return
+    whisper_ro = None
+    print("Romanian model unloaded.")
+    if icon:
+        icon.update_menu()
+
 
 # ── Word map ──────────────────────────────────────────────────────────────────
 
@@ -240,21 +316,85 @@ ICON_RECORDING = None
 ICON_PROCESSING = None
 
 
+_icon_cache: dict = {}
+
+
 def _make_mic_icon(color: str):
-    img = _PIL_Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    if color in _icon_cache:
+        return _icon_cache[color]
+
+    # Parse hex colour
+    hex_c = color.lstrip("#")
+    r = int(hex_c[0:2], 16)
+    g = int(hex_c[2:4], 16)
+    b = int(hex_c[4:6], 16)
+
+    # Draw a high-quality microphone icon programmatically
+    S = 64  # icon size
+    img = _PIL_Image.new("RGBA", (S, S), (0, 0, 0, 0))
     draw = _PIL_ImageDraw.Draw(img)
+
+    # ── Capsule body ──────────────────────────────────────────────────────────
+    cap_w = 20
+    cap_h = 36
+    cap_x0 = (S - cap_w) // 2
+    cap_y0 = 6
     draw.rounded_rectangle(
-        [24, 8, 40, 36], radius=8, fill=color, outline="white", width=2
+        [cap_x0, cap_y0, cap_x0 + cap_w, cap_y0 + cap_h],
+        radius=cap_w // 2,
+        fill=(r, g, b),
     )
-    for y in [16, 20, 24, 28]:
-        draw.line([(28, y), (36, y)], fill="white", width=2)
-    draw.arc([18, 32, 46, 52], 180, 0, fill="white", width=2)
-    draw.line([(32, 44), (32, 50)], fill="white", width=2)
-    draw.line([(24, 50), (40, 50)], fill="white", width=2)
-    draw.arc([10, 18, 22, 36], 270, 90, fill="white", width=2)
-    draw.arc([4, 12, 22, 42], 270, 90, fill="white", width=2)
-    draw.arc([42, 18, 54, 36], 90, 270, fill="white", width=2)
-    draw.arc([42, 12, 60, 42], 90, 270, fill="white", width=2)
+
+    # ── Grid lines on capsule ────────────────────────────────────────────────
+    grid_col = (max(0, r - 40), max(0, g - 40), max(0, b - 40), 200)
+    for dy in [10, 18, 26]:
+        y = cap_y0 + dy
+        draw.arc(
+            [cap_x0, y - 1, cap_x0 + cap_w, y + 1],
+            0, 180,
+            fill=grid_col,
+            width=1,
+        )
+
+    # ── Collar band ───────────────────────────────────────────────────────────
+    collar_y0 = cap_y0 + cap_h - 1
+    collar_y1 = collar_y0 + 4
+    draw.rectangle(
+        [cap_x0, collar_y0, cap_x0 + cap_w, collar_y1],
+        fill=(r, g, b),
+    )
+
+    # ── U-shaped yoke (arc) ───────────────────────────────────────────────────
+    yoke_y0 = cap_y0 + cap_h + 4
+    yoke_y1 = yoke_y0 + 10
+    draw.arc(
+        [cap_x0 - 10, yoke_y0, cap_x0 + cap_w + 10, yoke_y1],
+        0, 180,
+        fill=(r, g, b),
+        width=3,
+    )
+
+    # ── Stem (vertical line) ───────────────────────────────────────────────────
+    stem_x = S // 2
+    stem_y0 = yoke_y0 + 5
+    stem_y1 = stem_y0 + 6
+    draw.line(
+        [stem_x, stem_y0, stem_x, stem_y1],
+        fill=(r, g, b),
+        width=3,
+    )
+
+    # ── Base (horizontal foot) ─────────────────────────────────────────────────
+    base_y0 = stem_y1 - 1
+    base_y1 = base_y0 + 3
+    draw.arc(
+        [stem_x - 8, base_y0, stem_x + 8, base_y1],
+        190, 350,
+        fill=(r, g, b),
+        width=3,
+    )
+
+    _icon_cache[color] = img
     return img
 
 
@@ -277,9 +417,13 @@ def _update_tray(state: str):
 
 def audio_callback(indata, frames: int, time_info, status):
     global audio_level
-    if recording:
-        audio_chunks.append(indata.copy())
-    audio_level = float(np.sqrt(np.mean(indata**2)))
+    rms = math.sqrt(np.dot(indata.ravel(), indata.ravel()) / len(indata))
+    with _rec_lock:
+        if recording:
+            # Cap at 30 minutes of recording (~28,125 chunks at 1024 blocksize) to prevent memory issues
+            if len(audio_chunks) < 30000:
+                audio_chunks.append(indata.copy())
+        audio_level = rms
 
 
 # ── LLM cleanup ───────────────────────────────────────────────────────────────
@@ -288,38 +432,52 @@ def audio_callback(indata, frames: int, time_info, status):
 def _openai_compat_cleanup(
     base_url: str, model: str, raw: str, api_key: str = ""
 ) -> str:
-    import requests as _req
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    resp = _http.post(
-        f"{base_url}/chat/completions",
-        headers=headers,
-        json={
-            "model": model,
-            "messages": [
-                {"role": "system", "content": CLEANUP_SYSTEM},
-                {"role": "user", "content": raw},
-            ],
-        },
-        timeout=(1, 30),
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": CLEANUP_SYSTEM},
+            {"role": "user", "content": raw},
+        ],
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{base_url}/chat/completions", data=data, headers=headers
     )
-    resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"].strip()
+    try:
+        resp = urllib.request.urlopen(req, timeout=30)
+    except urllib.error.HTTPError as e:
+        resp = e
+    body = resp.read().decode("utf-8")
+    return json.loads(body)["choices"][0]["message"]["content"].strip()
 
 
 def _call_provider(name: str, raw: str) -> str:
-    if name == "gemini":
-        return gemini_client.generate_content(raw).text.strip()
-    if name == "openrouter":
-        return _openai_compat_cleanup(
-            "https://openrouter.ai/api/v1", OPENROUTER_MODEL, raw, openrouter_api_key
-        )
-    if name == "lmstudio":
-        return _openai_compat_cleanup(lmstudio_url, lmstudio_model, raw)
-    if name == "ollama":
-        return _openai_compat_cleanup(ollama_url, ollama_model, raw)
-    raise ValueError(f"Unknown provider: {name}")
+    delays = [0.5, 1.0, 2.0]
+    for attempt in range(3):
+        try:
+            if name == "gemini":
+                return gemini_client.generate_content(raw).text.strip()
+            if name == "openrouter":
+                return _openai_compat_cleanup(
+                    "https://openrouter.ai/api/v1", OPENROUTER_MODEL, raw, openrouter_api_key
+                )
+            if name == "lmstudio":
+                return _openai_compat_cleanup(lmstudio_url, lmstudio_model, raw, lmstudio_api_key)
+            if name == "ollama":
+                return _openai_compat_cleanup(ollama_url, ollama_model, raw)
+            raise ValueError(f"Unknown provider: {name}")
+        except Exception as exc:
+            if attempt < 2 and (
+                isinstance(exc, urllib.error.HTTPError) and exc.code in (429, 500, 502, 503, 504)
+                or isinstance(exc, urllib.error.URLError)
+                or "Connection" in type(exc).__name__
+            ):
+                time.sleep(delays[attempt])
+                continue
+            raise
 
 
 def _local_punct(text: str) -> str:
@@ -334,14 +492,12 @@ def _local_punct(text: str) -> str:
 
 
 def cleanup_text(raw: str) -> str:
-    import requests as _req
     if CLEANUP_MODE == "punct":
         return _local_punct(raw)
     try:
         return _call_provider(LLM_PROVIDER, raw)
-    except (_req.ConnectionError, _req.Timeout):
+    except Exception:
         if LLM_FALLBACK:
-            print(f"  [{LLM_PROVIDER} unreachable → {LLM_FALLBACK}]")
             return _call_provider(LLM_FALLBACK, raw)
         raise
 
@@ -349,17 +505,28 @@ def cleanup_text(raw: str) -> str:
 # ── Transcription + cleanup ────────────────────────────────────────────────────
 
 
-def transcribe_and_paste(audio):
+def transcribe_and_paste(audio, lang="en"):
     t_start = time.perf_counter()
     status_queue.put("processing")
 
-    if whisper is None:
-        print("Whisper is not ready; skipping transcription.")
-        status_queue.put("idle")
-        return
+    if lang == "ro":
+        model = _ensure_whisper_ro()
+        if model is None:
+            print("Romanian model failed to load; skipping.")
+            status_queue.put("idle")
+            return
+    else:
+        model = whisper
+        if model is None:
+            print("Whisper is not ready; skipping transcription.")
+            status_queue.put("idle")
+            return
 
     audio_f32 = audio.flatten().astype(np.float32)
-    segments, _ = whisper.transcribe(audio_f32, beam_size=BEAM_SIZE, vad_filter=False)
+    segments, _ = model.transcribe(
+        audio_f32, beam_size=BEAM_SIZE, vad_filter=False,
+        language=lang if lang == "ro" else None,
+    )
     raw = " ".join(seg.text.strip() for seg in segments).strip()
     t_whisper = time.perf_counter()
 
@@ -368,27 +535,31 @@ def transcribe_and_paste(audio):
         status_queue.put("idle")
         return
 
-    print(f"Raw:     {raw}")
+    print(f"Raw [{lang}]: {raw}")
     print(f"  [whisper]  {(t_whisper - t_start) * 1000:.0f}ms")
 
-    try:
-        cleaned = cleanup_text(raw)
-    except Exception as exc:
-        print(f"LLM error ({LLM_PROVIDER}): {exc}  —  using raw transcript.")
-        cleaned = raw
-    t_llm = time.perf_counter()
-    print(f"  [llm]      {(t_llm - t_whisper) * 1000:.0f}ms")
+    if lang == "en":
+        try:
+            cleaned = cleanup_text(raw)
+        except Exception as exc:
+            print(f"LLM error ({LLM_PROVIDER}): {exc}  —  using raw transcript.")
+            cleaned = raw
+        t_llm = time.perf_counter()
+        print(f"  [llm]      {(t_llm - t_whisper) * 1000:.0f}ms")
 
-    if WORD_MAP:
-        cleaned = _apply_word_map(cleaned, WORD_MAP)
+        if WORD_MAP:
+            cleaned = _apply_word_map(cleaned, WORD_MAP)
+    else:
+        cleaned = _local_punct(raw)
 
     print(f"Cleaned: {cleaned}")
     print(f"  [total]    {(time.perf_counter() - t_start) * 1000:.0f}ms")
 
+    global _pasting
     pyperclip.copy(cleaned)
-    time.sleep(0.05)
-    pyautogui.hotkey("ctrl", "v")
-    time.sleep(0.15)
+    _pasting = True
+    pyautogui.hotkey("ctrl", "shift", "v")
+    _pasting = False
     _resume_media()
 
     status_queue.put("idle")
@@ -397,52 +568,81 @@ def transcribe_and_paste(audio):
 # ── Media state helpers ───────────────────────────────────────────────────────
 
 
-def _pause_media_if_playing():
-    global _paused_media_sessions
+# ── Media state helpers (PowerShell-based) ─────────────────────────────────
 
-    if not _media_controls_available:
-        _paused_media_sessions = []
-        return
+_PS_PAUSE_PLAYING = r"""
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$null = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager, Windows.Media.Control, ContentType = WindowsRuntime]
+$async = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager]::RequestAsync()
+$manager = Await $async ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager])
+if (-not $manager) { exit 1 }
+$sessions = $manager.GetSessions()
+foreach ($s in $sessions) {
+    $info = $s.GetPlaybackInfo()
+    if ($info.PlaybackStatus -eq 'Playing') { $s.TryPauseAsync() | Out-Null; Write-Host 'PAUSED' }
+}
+"""
 
-    async def do_pause():
-        paused = []
-        try:
-            mgr = await MediaManager.request_async()
-            sessions = mgr.get_sessions()
-            for s in sessions:
-                info = s.get_playback_info()
-                if info and info.playback_status == 4:  # 4 = Playing
-                    await s.try_pause_async()
-                    paused.append(s)
-        except Exception as e:
-            print(f"Media pause error: {e}")
-        return paused
+_PS_RESUME_PAUSED = r"""
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$null = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager, Windows.Media.Control, ContentType = WindowsRuntime]
+$async = [Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager]::RequestAsync()
+$manager = Await $async ([Windows.Media.Control.GlobalSystemMediaTransportControlsSessionManager])
+if (-not $manager) { exit 1 }
+$sessions = $manager.GetSessions()
+foreach ($s in $sessions) {
+    $info = $s.GetPlaybackInfo()
+    if ($info.PlaybackStatus -eq 'Paused') { $s.TryPlayAsync() | Out-Null; Write-Host 'PLAYING' }
+}
+"""
 
+_POWERSHELL_AWAIT = r"""
+function Await($WinRtTask, $ResultType) {
+    $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { 
+        $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+    })[0]
+    $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
+    $netTask = $asTask.Invoke($null, @($WinRtTask))
+    $netTask.Wait(-1) | Out-Null
+    $netTask.Result
+}
+"""
+
+def _run_ps_media(action: str = "pause") -> str:
+    """Run PowerShell media control, return result."""
+    body = _PS_PAUSE_PLAYING if action == "pause" else _PS_RESUME_PAUSED
+    script = _POWERSHELL_AWAIT + body
     try:
-        _paused_media_sessions = asyncio.run(do_pause())
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return result.stdout.strip()
     except Exception as e:
-        print(f"Asyncio run error: {e}")
-        _paused_media_sessions = []
+        print(f"Media control error: {e}")
+        return ""
+
+
+def _pause_media_if_playing():
+    global _media_was_paused
+    _media_paused_event.clear()
+    _media_was_paused = False
+    result = _run_ps_media("pause")
+    _media_was_paused = (result == "PAUSED")
+    _media_paused_event.set()
 
 
 def _resume_media():
-    global _paused_media_sessions
-    if not _paused_media_sessions:
+    global _media_was_paused
+    _media_paused_event.wait(timeout=5)
+    if not _media_was_paused:
         return
-
-    async def do_resume(sessions):
-        for s in sessions:
-            try:
-                await s.try_play_async()
-            except Exception as e:
-                print(f"Media resume error: {e}")
-
-    try:
-        asyncio.run(do_resume(_paused_media_sessions))
-    except Exception as e:
-        print(f"Asyncio run resume error: {e}")
-
-    _paused_media_sessions = []
+    result = _run_ps_media("resume")
+    if result == "PLAYING":
+        print("Media resumed")
+    _media_was_paused = False
 
 
 # ── Keyboard logic ────────────────────────────────────────────────────────────
@@ -455,8 +655,9 @@ def _on_both_pressed():
     if whisper is None:
         print("Whisper is still loading. Try again in a moment.")
         return
-    recording = True
-    audio_chunks = []
+    with _rec_lock:
+        recording = True
+        audio_chunks = []
     threading.Thread(target=_pause_media_if_playing, daemon=True).start()
     status_queue.put("recording")
     print("Recording…")
@@ -466,33 +667,59 @@ def _on_both_released():
     global recording
     if not recording:
         return
-    recording = False
+    lang = _combo_lang
+    with _rec_lock:
+        recording = False
+        chunks = list(audio_chunks)
     print("Stopped.")
-    if not audio_chunks:
+    if not chunks:
         status_queue.put("idle")
         return
-    audio = np.concatenate(audio_chunks, axis=0)
-    threading.Thread(target=transcribe_and_paste, args=(audio,), daemon=True).start()
+    audio = np.concatenate(chunks, axis=0)
+    min_samples = int(SAMPLE_RATE * 0.3)
+    if len(audio) < min_samples:
+        print("Recording too short, ignoring.")
+        status_queue.put("idle")
+        return
+    threading.Thread(target=transcribe_and_paste, args=(audio, lang), daemon=True).start()
 
 
 _win_down = False
 _ctrl_down = False
+_shift_down = False
 _combo_active = False
+_combo_lang = "en"  # which language combo is active
+_last_key_time = 0.0
+_KEY_TIMEOUT = 60.0  # seconds — reset stuck keys after this
 
 
 def _on_key_event(event):
-    global _win_down, _ctrl_down, _combo_active
+    global _win_down, _ctrl_down, _shift_down, _combo_active, _combo_lang, _last_key_time
+    if _pasting:
+        return
+    now = time.time()
+    if now - _last_key_time > _KEY_TIMEOUT:
+        _win_down = False
+        _ctrl_down = False
+        _shift_down = False
+    _last_key_time = now
     is_down = event.event_type == keyboard.KEY_DOWN
     name = (event.name or "").lower()
     if "windows" in name:
         _win_down = is_down
     elif "ctrl" in name:
         _ctrl_down = is_down
-    both = _win_down and _ctrl_down
-    if both and not _combo_active:
+    elif "shift" in name:
+        _shift_down = is_down
+
+    combo_en = _win_down and _ctrl_down
+    combo_ro = _win_down and _shift_down and not _ctrl_down
+
+    if (combo_en or combo_ro) and not _combo_active:
         _combo_active = True
+        _combo_lang = "ro" if combo_ro else "en"
         _on_both_pressed()
-    elif not both and _combo_active:
+    elif not (combo_en or combo_ro) and _combo_active:
         _combo_active = False
         _on_both_released()
 
@@ -507,7 +734,6 @@ class Overlay:
     _PROC_RGBA = tuple(int(COLOR_PROC[i : i + 2], 16) for i in (1, 3, 5)) + (255,)
 
     def __init__(self):
-        import tkinter as tk
         self._rng = np.random.default_rng()
         self._dot_h = [float(DOT_R)] * NUM_DOTS
         _pos = np.linspace(-np.pi / 2, np.pi / 2, NUM_DOTS)
@@ -517,12 +743,12 @@ class Overlay:
         self._t_frac = 1.0
         self._frame_ref = None
 
-        root = tk.Tk()
+        root = _tk.Tk()
         root.title("wispr-overlay")
         root.withdraw()
         self.root = root
 
-        ov = tk.Toplevel(root)
+        ov = _tk.Toplevel(root)
         ov.withdraw()
         ov.overrideredirect(True)
         ov.wm_attributes("-topmost", True)
@@ -541,7 +767,7 @@ class Overlay:
         self._visible = False
         ov.geometry(f"{OVERLAY_W}x{OVERLAY_H}+{x}+{sh}")
 
-        c = tk.Canvas(
+        c = _tk.Canvas(
             ov, width=OVERLAY_W, height=OVERLAY_H, bg=KEY_COLOR, highlightthickness=0
         )
         c.pack()
@@ -706,6 +932,12 @@ class Overlay:
 
 def _quit(icon, item):
     icon.stop()
+    if _audio_stream is not None:
+        _audio_stream.stop()
+        _audio_stream.close()
+    if keyboard is not None and _keyboard_hook_ref is not None:
+        keyboard.unhook(_keyboard_hook_ref)
+    _release_single_instance()
     os._exit(0)
 
 
@@ -722,9 +954,9 @@ def _set_provider(name: str):
     def _handler(icon, item):
         global LLM_PROVIDER
         ok = _setup_provider(name, fatal=False)
-        if ok:
-            LLM_PROVIDER = name
+        LLM_PROVIDER = name if ok else LLM_PROVIDER
         icon.update_menu()
+
     return _handler
 
 
@@ -746,146 +978,168 @@ def _build_menu():
         ),
         _pystray_MenuItem("Provider", _pystray_Menu(*provider_items)),
         _pystray_Menu.SEPARATOR,
+        _pystray_MenuItem(
+            lambda item: f"Romanian model: {'loaded' if whisper_ro else 'not loaded'}",
+            _unload_whisper_ro,
+            enabled=lambda item: whisper_ro is not None,
+        ),
+        _pystray_Menu.SEPARATOR,
         _pystray_MenuItem("Quit Wispr", _quit),
     )
 
 
 def _load_whisper():
     global whisper, whisper_error
-    print(f"Loading Whisper {WHISPER_MODEL} on {WHISPER_DEVICE}/{WHISPER_COMPUTE} …")
     from faster_whisper import WhisperModel
 
-    attempts = [
-        (WHISPER_DEVICE, WHISPER_COMPUTE),
-        ("cpu", "int8"),
-    ]
+    attempts = []
+    gpu = _cuda_gpu()
+    if gpu:
+        print(f"[whisper] GPU detected: {gpu[0:60]}")
+        attempts.append((WHISPER_DEVICE, WHISPER_COMPUTE))
+    attempts.append(("cpu", "int8"))
 
     last_error = None
     for device, compute_type in attempts:
         try:
-            print(f"Trying Whisper on {device}/{compute_type} …")
             whisper = WhisperModel(
                 WHISPER_MODEL, device=device, compute_type=compute_type
             )
+            print(f"Whisper loaded on {device}")
             whisper_error = None
             whisper_ready.set()
-            print(
-                f"Whisper ready on {device}/{compute_type}. Hold the Wispr hotkey to record."
-            )
             return
         except Exception as exc:
             last_error = exc
-            print(f"Whisper load failed on {device}/{compute_type}: {exc}")
 
     whisper_error = last_error
-    whisper_ready.clear()
-    print("Whisper could not be loaded. Transcription is disabled until restart.")
+    whisper_ready.set()  # unblock any waiters — they'll check whisper is None
+    print(f"ERROR: Whisper failed to load: {last_error}")
+    print("Voice transcription is unavailable. Restart Wispr to retry.")
 
 
 def main():
-    global tray_icon, np, sd, pyautogui, pyperclip, keyboard
+    global tray_icon, np, sd, pyautogui, pyperclip, keyboard, _audio_stream
     global _PIL_Image, _PIL_ImageDraw, _PIL_ImageTk
     global _pystray_Icon, _pystray_MenuItem, _pystray_Menu
-    global _http, MediaManager, _media_controls_available
     global LLM_PROVIDER, LLM_FALLBACK, CLEANUP_MODE, OPENROUTER_MODEL
     global ICON_IDLE, ICON_RECORDING, ICON_PROCESSING
+    global _keyboard_hook_ref, _tk
 
     _t_main_start = time.perf_counter()
+    print(f"[t+{(_t_main_start - _t_main_start) * 1000:.0f}ms] main() started")
+
+    # When started by Wispr.exe launcher, exit if it dies (stdin pipe -> EOF).
+    if os.getenv("WISPR_LAUNCHER") == "1":
+        def _watch_launcher():
+            try:
+                while os.read(0, 1):
+                    pass
+            except OSError:
+                pass
+            os._exit(0)
+        threading.Thread(target=_watch_launcher, daemon=True).start()
+
+    # ── Start LM Studio server if lms CLI is available ───────────────────────
+    import shutil
+    if shutil.which("lms"):
+        subprocess.Popen(
+            ["lms", "server", "start"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
 
     # ── Deferred heavy imports ────────────────────────────────────────────────
     # numpy must be imported single-threaded (circular import risk in threads).
     # All other packages are independent and safe to import in parallel.
-    import numpy as _np
     np = _np
 
     import concurrent.futures as _cf
 
     def _import_sounddevice():
         import sounddevice as _sd
+
         return _sd
 
     def _import_pyautogui():
         import pyautogui as _pag
+
         return _pag
 
     def _import_pyperclip():
         import pyperclip as _pc
+
         return _pc
 
     def _import_keyboard():
         import keyboard as _kb
+
         return _kb
 
     def _import_pil():
         from PIL import Image as _Im, ImageDraw as _ID, ImageTk as _ITk
+
         return _Im, _ID, _ITk
 
     def _import_pystray():
         from pystray import Icon as _Ic, MenuItem as _MI, Menu as _Me
+
         return _Ic, _MI, _Me
 
-    def _import_requests_dotenv():
-        import requests as _req
+    def _import_dotenv():
         from dotenv import load_dotenv as _ld
-        return _req, _ld
 
-    def _import_winrt():
-        try:
-            from winrt.windows.media.control import (
-                GlobalSystemMediaTransportControlsSessionManager as _MM,
-            )
-            return _MM, True
-        except Exception:
-            return None, False
+        return _ld
 
-    with _cf.ThreadPoolExecutor(max_workers=8) as _pool:
-        _f_sd  = _pool.submit(_import_sounddevice)
+    def _import_tk():
+        import tkinter as _tk
+
+        return _tk
+
+    with _cf.ThreadPoolExecutor(max_workers=9) as _pool:
+        _f_sd = _pool.submit(_import_sounddevice)
         _f_pag = _pool.submit(_import_pyautogui)
-        _f_pc  = _pool.submit(_import_pyperclip)
-        _f_kb  = _pool.submit(_import_keyboard)
+        _f_pc = _pool.submit(_import_pyperclip)
+        _f_kb = _pool.submit(_import_keyboard)
         _f_pil = _pool.submit(_import_pil)
         _f_pst = _pool.submit(_import_pystray)
-        _f_rd  = _pool.submit(_import_requests_dotenv)
-        _f_wrt = _pool.submit(_import_winrt)
+        _f_dn = _pool.submit(_import_dotenv)
+        _f_tk = _pool.submit(_import_tk)
 
-        sd                        = _f_sd.result()
-        pyautogui                 = _f_pag.result()
-        pyperclip                 = _f_pc.result()
-        keyboard                  = _f_kb.result()
+        sd = _f_sd.result()
+        pyautogui = _f_pag.result()
+        pyperclip = _f_pc.result()
+        keyboard = _f_kb.result()
         _PIL_Image, _PIL_ImageDraw, _PIL_ImageTk = _f_pil.result()
         _pystray_Icon, _pystray_MenuItem, _pystray_Menu = _f_pst.result()
-        _requests, load_dotenv    = _f_rd.result()
-        MediaManager, _media_controls_available = _f_wrt.result()
+        load_dotenv = _f_dn.result()
+        _tk = _f_tk.result()
 
     pyautogui.FAILSAFE = False
     pyautogui.PAUSE = 0
 
     load_dotenv()
+
     LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()
     LLM_FALLBACK = os.getenv("LLM_FALLBACK", "").lower()
     CLEANUP_MODE = os.getenv("CLEANUP_MODE", "punct").lower()
     OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", OPENROUTER_DEFAULT)
 
-    _http = _requests.Session()
-    _http.mount("http://", _requests.adapters.HTTPAdapter(max_retries=0))
-    _http.mount("https://", _requests.adapters.HTTPAdapter(max_retries=0))
-
-    # ── Build tray icons (deferred from module level) ─────────────────────────
+    # Build tray icons
     ICON_IDLE = _make_mic_icon("#22c55e")
     ICON_RECORDING = _make_mic_icon("#ef4444")
     ICON_PROCESSING = _make_mic_icon("#f59e0b")
 
-    # ── LLM provider setup ────────────────────────────────────────────────────
+    # LLM provider setup (skip in bench mode)
     if not _BENCH_MODE:
         if LLM_PROVIDER != "punct":
             _setup_provider(LLM_PROVIDER, fatal=True)
         if LLM_FALLBACK and LLM_FALLBACK != LLM_PROVIDER:
             _setup_provider(LLM_FALLBACK, fatal=False)
 
+    # Start whisper loading in background
     threading.Thread(target=_load_whisper, daemon=True).start()
 
-    # Start stream init in background — overlaps with tray/keyboard setup
-    _stream_container = [None]
+    # Start audio stream in background
     _stream_ready = threading.Event()
 
     def _init_stream():
@@ -897,13 +1151,17 @@ def main():
             blocksize=1024,
         )
         s.start()
-        _stream_container[0] = s
+        global _audio_stream
+        _audio_stream = s
         _stream_ready.set()
 
     threading.Thread(target=_init_stream, daemon=True).start()
 
-    keyboard.hook(_on_key_event)
+    # Setup keyboard hook
+    _keyboard_hook_ref = keyboard.hook(_on_key_event)
+    print("Wispr ready! Win+Ctrl = English, Win+Shift = Romanian")
 
+    # Start tray icon
     tray_icon = _pystray_Icon(
         "Wispr",
         ICON_IDLE,
@@ -912,9 +1170,8 @@ def main():
     )
     threading.Thread(target=tray_icon.run, daemon=True).start()
 
-    # Ensure stream is ready before proceeding
+    # Wait for stream to be ready
     _stream_ready.wait(timeout=10)
-    stream = _stream_container[0]
 
     if _BENCH_MODE:
         _t_interactive = time.perf_counter()
@@ -922,12 +1179,10 @@ def main():
         _bench_file = os.path.join(tempfile.gettempdir(), "wispr_bench.txt")
         with open(_bench_file, "w") as _f:
             _f.write(f"{_elapsed_ms:.1f}")
-        print(f"[BENCH] interactive in {_elapsed_ms:.1f}ms (main() only)")
-        print(f"[BENCH] result written to {_bench_file}")
-        time.sleep(0.5)
+        print(f"[BENCH] interactive in {_elapsed_ms:.1f}ms")
         tray_icon.stop()
-        stream.stop()
-        stream.close()
+        _audio_stream.stop()
+        _audio_stream.close()
         keyboard.unhook_all()
         _release_single_instance()
         os._exit(0)

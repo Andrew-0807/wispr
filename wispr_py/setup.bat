@@ -18,9 +18,9 @@ call .venv\Scripts\activate.bat
 :: Upgrade pip quietly
 python -m pip install --upgrade pip -q
 
-:: Install PyTorch with CUDA 12.1 support first (RTX 3060)
-echo Installing PyTorch (CUDA 12.1)...
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 -q
+:: Install PyTorch with CUDA 12.8 support first (RTX 3060)
+echo Installing PyTorch (CUDA 12.8)...
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128 -q
 
 :: Install the rest
 echo Installing dependencies...

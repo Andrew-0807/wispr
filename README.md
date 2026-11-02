@@ -1,103 +1,77 @@
 # Wispr
 
-Windows voice dictation tool. Hold **Win + Space** to record, release to transcribe and paste into whatever window is focused.
+Ultra-lightweight system-wide voice dictation tool for Windows in native Rust.
 
-## How it works
+Hold **Ctrl + Win** (English) or **Shift + Win** (Multilingual / Romanian) to record, release to transcribe and paste into the active window.
 
-1. **Record** — hold Win + Space; a pill-shaped overlay slides up from the taskbar showing a live audio visualizer
-2. **Transcribe** — on release, [faster-whisper](https://github.com/SYSTRAN/faster-whisper) runs locally on your GPU
-3. **Clean up** — raw transcript is sent to an LLM to remove fillers, fix grammar, and fix punctuation
-4. **Paste** — cleaned text is copied to clipboard and pasted automatically
+> [!NOTE]
+> The primary implementation is the native Rust engine located in `Wispr_rust/`.
+> The original Python implementation has been moved to `wispr_py/` as an archived reference.
 
-Media playback is paused while you speak and resumed after pasting.
+---
 
-## Features
+## Architecture and Implementations
 
-- Push-to-talk with **Win + Space** — works globally, across all apps
-- Local speech recognition via faster-whisper (no audio leaves your machine)
-- LLM cleanup via Gemini, OpenRouter, LM Studio, or Ollama — with automatic fallback
-- Floating overlay with audio-level visualizer and processing spinner
-- System tray icon (green = idle, red = recording, amber = transcribing)
-- Word correction dictionary for recurring misrecognitions
-
-## Requirements
-
-- Windows 10 / 11
-- Python 3.11+
-- CUDA-capable GPU (tested on RTX 3060 12 GB)
-- An LLM provider (see [Configuration](#configuration))
-
-## Installation
-
-```bat
-setup.bat
+```
+wispr/
+├── Wispr_rust/         # Active: Native Rust desktop assistant (<150 MB RAM, instant launch)
+├── wispr_py/           # Archived: Python reference implementation
+├── docs/               # Technical specs and STT model benchmark reports
+└── autoresearch/       # Evaluation frameworks and startup experiments
 ```
 
-Or manually:
+| Metric | Wispr Rust (`Wispr_rust/`) | Wispr Python (`wispr_py/` - Archived) |
+| :--- | :--- | :--- |
+| Runtime Overhead | < 15 MB Win32 | ~250 - 350 MB Python/Tkinter |
+| Active RAM | ~150 - 250 MB | ~700 - 885 MB |
+| Startup Time | < 100 ms | ~1.1 - 4.0 s |
+| Binary Packaging | Single native executable | PyInstaller bundle or Python venv |
 
-```bash
-pip install -r requirements.txt
-```
+---
 
-## Configuration
+## How It Works
 
-Copy `.env.example` to `.env` and configure your LLM provider:
+1. **Record**: Hold `Ctrl + Win` (or `Shift + Win`). A floating pill overlay slides up with an animated audio visualizer. Active media playback pauses automatically.
+2. **Transcribe**: On release, local Whisper inference runs with Vulkan GPU acceleration.
+3. **Clean up**: Raw transcription runs through custom dictionary replacements (`words.json`) and optional LLM formatting (filler removal, punctuation).
+4. **Paste**: Cleaned text injects into the active window, previous clipboard contents restore, and media playback resumes.
 
-```env
-LLM_PROVIDER=gemini
-```
+---
 
-### LLM providers
+## Getting Started (Wispr Rust)
 
-| Provider | `LLM_PROVIDER` value | Required env vars |
-| --- | --- | --- |
-| Google Gemini | `gemini` | `GEMINI_API_KEY` |
-| OpenRouter | `openrouter` | `OPENROUTER_API_KEY`, optionally `OPENROUTER_MODEL` |
-| LM Studio (local) | `lmstudio` | optionally `LMSTUDIO_URL`, `LMSTUDIO_MODEL` |
-| Ollama (local) | `ollama` | optionally `OLLAMA_URL`, `OLLAMA_MODEL` |
+### Requirements
 
-Get a free Gemini key at [aistudio.google.com](https://aistudio.google.com/app/apikey).
+* Windows 10 or 11 (x64)
+* Visual Studio Build Tools (C++ MSVC)
+* LLVM (`scoop install llvm`)
+* Vulkan SDK or supported GPU driver
 
-**Fallback:** set `LLM_FALLBACK` to a second provider. If the primary is unreachable, it falls back automatically and recovers when the primary comes back.
+### Setup and Build
 
-```env
-LLM_PROVIDER=gemini
-LLM_FALLBACK=lmstudio
-```
+1. Copy `.env.example` to `.env` in `Wispr_rust/`:
+   ```bat
+   cd Wispr_rust
+   copy .env.example .env
+   ```
+2. Configure your LLM provider in `.env` (Gemini, OpenRouter, LM Studio, Ollama).
+3. Place GGML / GGUF model weights into `Wispr_rust/models/`:
+   * `ggml-small.en.bin` for English (`Ctrl + Win`)
+   * `ggml-large-v3-turbo.bin` for Multilingual (`Shift + Win`)
+4. Build release binary:
+   ```bat
+   build.bat
+   ```
+5. Run the assistant:
+   ```bat
+   run.bat
+   ```
 
-**Local LLM recommendations** (fast, low RAM):
+---
 
-- LM Studio: `qwen2.5-1.5b-instruct` (~1 GB)
-- Ollama: `qwen2.5:1.5b` — install with `ollama pull qwen2.5:1.5b`
+## Word Corrections
 
-## Running
-
-```bat
-run.bat
-```
-
-Right-click → **Run as administrator** if the hotkey doesn't respond. Administrator rights are required for global keyboard hooks.
-
-First launch downloads the Whisper model (~800 MB for `small.en`) automatically.
-
-### Changing the Whisper model
-
-Edit the `WHISPER_MODEL` constant at the top of [wispr.py](wispr.py):
-
-| Model | Size | Speed | Accuracy |
-| --- | --- | --- | --- |
-| `tiny.en` | ~75 MB | fastest | lowest |
-| `small.en` | ~460 MB | fast | good |
-| `medium.en` | ~1.5 GB | moderate | better |
-| `large-v3-turbo` | ~1.5 GB | moderate | best |
-
-### Python path
-
-`run.bat` auto-detects a `.venv` in the project folder. If you use a conda env or system Python, edit the `PYTHON=` line in `run.bat` to point to the right interpreter.
-
-## Word corrections
-
-Edit `words.json` to fix recurring misrecognitions. Keys are case-insensitive; longest match wins:
+Edit `words.json` in `Wispr_rust/` to substitute recurring misrecognitions. Keys are case-insensitive; longest match takes precedence:
 
 ```json
 {
@@ -106,24 +80,9 @@ Edit `words.json` to fix recurring misrecognitions. Keys are case-insensitive; l
 }
 ```
 
-Replacements run after LLM cleanup using whole-word matching.
+---
 
-## komorebi
+## Archived Python Version
 
-Exclude the overlay window from tiling:
-
-```bat
-komorebic ignore-rule title "wispr-overlay"
-```
-
-## Files
-
-| File | Purpose |
-| --- | --- |
-| `wispr.py` | entire app |
-| `words.json` | word correction dictionary |
-| `.env` | API keys and provider config (gitignored) |
-| `.env.example` | config template |
-| `requirements.txt` | Python dependencies |
-| `run.bat` | launcher |
-| `setup.bat` | one-time dependency installer |
+The Python implementation using `faster-whisper` is preserved in `wispr_py/`.
+See `wispr_py/README.md` for historical running instructions.

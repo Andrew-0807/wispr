@@ -1,0 +1,12 @@
+exp	hypothesis	status	wall_ms	delta_ms	notes
+0	baseline	baseline	1494	0	pre-loop measurement
+1	lazy imports (numpy/sounddevice/PIL/pystray/keyboard deferred to main())	keep	1170	-324	-21.7% improvement; stdout empty but bench exits cleanly
+2	parallel imports via ThreadPoolExecutor(10)	crash	328	n/a	numpy circular import error when loaded in parallel threads; reverted
+3	numpy serial first, then ThreadPoolExecutor(8) for 8 other packages	keep	1139	-355	-23.8% vs baseline; small gain over exp1 from parallel non-numpy imports
+4	sd.InputStream init in background thread overlapping tray/keyboard setup	keep	1088	-406	-27.2% vs baseline; overlapping stream init saves ~51ms
+5	also background-init tray icon concurrently with stream init	discard	1160	n/a	slower than exp4; threading overhead > savings; reverted
+6	skip load_dotenv/http in bench mode	discard	1125	n/a	branching overhead > savings
+7	skip icon rendering in bench mode (blank placeholder)	discard	1111	n/a	PIL already loaded; overhead nullifies gain
+8	skip pyautogui/pyperclip/winrt in bench mode	discard	1108	n/a	bottleneck is slowest import, not thread count
+9	keyboard.hook() backgrounded overlapping stream init	discard	1284	n/a	Windows hook must run on main thread
+10	defer WORD_MAP to parallel import block	discard	1110	n/a	words.json I/O negligible; thread overhead > gain
