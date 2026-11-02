@@ -14,6 +14,7 @@ cargo build --release
 if %errorlevel% equ 0 (
     if not exist "target\release" mkdir "target\release"
     copy /y "E:\w\release\wispr.exe" "target\release\wispr.exe" >nul
+    copy /y "E:\w\release\*.dll" "target\release\" >nul 2>&1
     echo.
     echo Build successful: target\release\wispr.exe
 ) else (

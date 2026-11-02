@@ -67,7 +67,7 @@ fn init_logging() {
         }
     }
 
-    if let Ok(file) = OpenOptions::new().create(true).write(true).append(true).open(&log_path) {
+    if let Ok(file) = OpenOptions::new().create(true).append(true).open(&log_path) {
         let target = Box::new(file);
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
             .target(env_logger::Target::Pipe(target))
@@ -105,10 +105,11 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // 3. Initialize Whisper Speech-to-Text Engine
+    // 3. Initialize Speech-to-Text Engine (SenseVoiceSmall for English, Whisper for Romanian)
     let initial_cfg = config.read().clone();
     let whisper_engine = Arc::new(WhisperEngine::new(
         initial_cfg.model_en_path.clone(),
+        initial_cfg.tokens_en_path.clone(),
         initial_cfg.model_ro_path.clone(),
     ));
 

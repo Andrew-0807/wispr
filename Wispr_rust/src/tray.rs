@@ -103,7 +103,7 @@ unsafe extern "system" fn tray_wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lp
             LRESULT(0)
         }
         WM_COMMAND => {
-            let id = (wparam.0 & 0xFFFF) as usize;
+            let id = wparam.0 & 0xFFFF;
             handle_command(id, hwnd);
             LRESULT(0)
         }

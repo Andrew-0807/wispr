@@ -131,14 +131,12 @@ unsafe extern "system" fn low_level_keyboard_proc(code: i32, wparam: WPARAM, lpa
                 None
             };
 
-            if new_active.is_some() && state.active_combo.is_none() {
-                let lang = new_active.unwrap();
+            if let (Some(lang), true) = (new_active, state.active_combo.is_none()) {
                 state.active_combo = Some(lang);
                 if let Some(ref sender) = state.sender {
                     let _ = sender.send(HookEvent::StartRecording(lang));
                 }
-            } else if new_active.is_none() && state.active_combo.is_some() {
-                let lang = state.active_combo.unwrap();
+            } else if let (true, Some(lang)) = (new_active.is_none(), state.active_combo) {
                 state.active_combo = None;
                 if let Some(ref sender) = state.sender {
                     let _ = sender.send(HookEvent::StopRecording(lang));

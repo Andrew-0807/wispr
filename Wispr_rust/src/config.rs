@@ -75,6 +75,7 @@ pub struct AppConfig {
     pub ollama_model: String,
 
     pub model_en_path: PathBuf,
+    pub tokens_en_path: PathBuf,
     pub model_ro_path: PathBuf,
 }
 
@@ -118,7 +119,8 @@ impl AppConfig {
         let ollama_url = std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://localhost:11434/v1".to_string());
         let ollama_model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5:1.5b".to_string());
 
-        let model_en_path = find_model_path("ggml-small.en.bin");
+        let model_en_path = find_model_path("sense-voice.int8.onnx");
+        let tokens_en_path = find_model_path("sense-voice-tokens.txt");
         let model_ro_path = find_model_path("ggml-large-v3-turbo.bin");
 
         Self {
@@ -135,6 +137,7 @@ impl AppConfig {
             ollama_url,
             ollama_model,
             model_en_path,
+            tokens_en_path,
             model_ro_path,
         }
     }
@@ -208,7 +211,7 @@ impl CustomDictionary {
         }
 
         let mut entries: Vec<(String, String)> = words_map.into_iter().collect();
-        entries.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        entries.sort_by_key(|b| std::cmp::Reverse(b.0.len()));
 
         let mut compiled = Vec::new();
         for (k, v) in entries {
