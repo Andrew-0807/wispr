@@ -2,13 +2,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::Instant;
 use parking_lot::Mutex;
-use windows::Win32::Foundation::{HMODULE, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_CONTROL, VK_LCONTROL, VK_LSHIFT, VK_LWIN, VK_RCONTROL, VK_RSHIFT, VK_RWIN, VK_SHIFT,
+    VK_SPACE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, SetWindowsHookExW,
-    UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, MSG, WH_KEYBOARD_LL, WM_KEYDOWN,
+    CallNextHookEx, DispatchMessageW, GetMessageW, PeekMessageW, SetWindowsHookExW,
+    UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, MSG, PM_NOREMOVE, WH_KEYBOARD_LL, WM_KEYDOWN,
     WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
 };
 
@@ -28,6 +30,7 @@ struct HookState {
     win_down: bool,
     ctrl_down: bool,
     shift_down: bool,
+    space_down: bool,
     active_combo: Option<Language>,
     last_key_time: Option<Instant>,
     sender: Option<Sender<HookEvent>>,
@@ -37,6 +40,7 @@ static HOOK_STATE: Mutex<HookState> = Mutex::new(HookState {
     win_down: false,
     ctrl_down: false,
     shift_down: false,
+    space_down: false,
     active_combo: None,
     last_key_time: None,
     sender: None,
@@ -60,13 +64,18 @@ impl KeyboardHookManager {
             state.win_down = false;
             state.ctrl_down = false;
             state.shift_down = false;
+            state.space_down = false;
             state.active_combo = None;
             state.last_key_time = Some(Instant::now());
         }
 
         let thread = std::thread::spawn(move || {
             unsafe {
-                let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(low_level_keyboard_proc), HMODULE::default(), 0);
+                let mut msg = MSG::default();
+                let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
+
+                let h_mod = GetModuleHandleW(None).unwrap_or_default();
+                let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(low_level_keyboard_proc), h_mod, 0);
                 if hook.is_err() {
                     log::error!("Failed to install low level keyboard hook");
                     return;
@@ -74,7 +83,6 @@ impl KeyboardHookManager {
                 let hook_handle = hook.unwrap();
                 log::info!("Low-level keyboard hook installed successfully.");
 
-                let mut msg = MSG::default();
                 while GetMessageW(&mut msg, None, 0, 0).as_bool() {
                     DispatchMessageW(&msg);
                 }
@@ -88,6 +96,8 @@ impl KeyboardHookManager {
 }
 
 unsafe extern "system" fn low_level_keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    let mut suppress_key = false;
+
     if code >= 0 && !IS_PASTING.load(Ordering::Relaxed) {
         let kbd_struct = *(lparam.0 as *const KBDLLHOOKSTRUCT);
         let vk = kbd_struct.vkCode as u16;
@@ -103,6 +113,7 @@ unsafe extern "system" fn low_level_keyboard_proc(code: i32, wparam: WPARAM, lpa
                     state.win_down = false;
                     state.ctrl_down = false;
                     state.shift_down = false;
+                    state.space_down = false;
                 }
             }
             state.last_key_time = Some(now);
@@ -117,11 +128,17 @@ unsafe extern "system" fn low_level_keyboard_proc(code: i32, wparam: WPARAM, lpa
                 x if x == VK_SHIFT.0 || x == VK_LSHIFT.0 || x == VK_RSHIFT.0 => {
                     state.shift_down = is_down;
                 }
+                x if x == VK_SPACE.0 => {
+                    state.space_down = is_down;
+                    if state.win_down {
+                        suppress_key = true;
+                    }
+                }
                 _ => {}
             }
 
-            let combo_en = state.win_down && state.ctrl_down;
-            let combo_ro = state.win_down && state.shift_down && !state.ctrl_down;
+            let combo_en = state.win_down && (state.ctrl_down || state.space_down);
+            let combo_ro = state.win_down && state.shift_down && !state.ctrl_down && !state.space_down;
 
             let new_active = if combo_ro {
                 Some(Language::Romanian)
@@ -133,11 +150,13 @@ unsafe extern "system" fn low_level_keyboard_proc(code: i32, wparam: WPARAM, lpa
 
             if let (Some(lang), true) = (new_active, state.active_combo.is_none()) {
                 state.active_combo = Some(lang);
+                log::info!("Hotkey combo pressed: {:?} (win={}, ctrl={}, space={}, shift={})", lang, state.win_down, state.ctrl_down, state.space_down, state.shift_down);
                 if let Some(ref sender) = state.sender {
                     let _ = sender.send(HookEvent::StartRecording(lang));
                 }
             } else if let (true, Some(lang)) = (new_active.is_none(), state.active_combo) {
                 state.active_combo = None;
+                log::info!("Hotkey combo released: {:?} (win={}, ctrl={}, space={}, shift={})", lang, state.win_down, state.ctrl_down, state.space_down, state.shift_down);
                 if let Some(ref sender) = state.sender {
                     let _ = sender.send(HookEvent::StopRecording(lang));
                 }
@@ -145,5 +164,9 @@ unsafe extern "system" fn low_level_keyboard_proc(code: i32, wparam: WPARAM, lpa
         }
     }
 
-    CallNextHookEx(HHOOK::default(), code, wparam, lparam)
+    if suppress_key {
+        LRESULT(1)
+    } else {
+        CallNextHookEx(HHOOK::default(), code, wparam, lparam)
+    }
 }

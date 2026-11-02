@@ -143,34 +143,65 @@ impl AppConfig {
     }
 }
 
+fn normalize_path(path: PathBuf) -> PathBuf {
+    if let Ok(canon) = path.canonicalize() {
+        let s = canon.to_string_lossy();
+        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            PathBuf::from(stripped)
+        } else {
+            canon
+        }
+    } else if let Ok(cwd) = std::env::current_dir() {
+        if path.is_relative() {
+            cwd.join(&path)
+        } else {
+            path
+        }
+    } else {
+        path
+    }
+}
+
 fn find_model_path(filename: &str) -> PathBuf {
-    let candidates = [
-        PathBuf::from(filename),
-        PathBuf::from("models").join(filename),
-        PathBuf::from("..").join("models").join(filename),
-        PathBuf::from("..").join("wispr_py").join("models").join(filename),
-    ];
+    let mut candidates = Vec::new();
+
+    // 1. Check relative to current exe
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join(filename));
+            candidates.push(dir.join("models").join(filename));
+            candidates.push(dir.join("..").join("models").join(filename));
+            candidates.push(dir.join("..").join("..").join("models").join(filename));
+            candidates.push(dir.join("..").join("..").join("..").join("models").join(filename));
+            candidates.push(dir.join("..").join("wispr_py").join("models").join(filename));
+        }
+    }
+
+    // 2. Check relative to current working directory
+    candidates.push(PathBuf::from(filename));
+    candidates.push(PathBuf::from("models").join(filename));
+    candidates.push(PathBuf::from("Wispr_rust").join("models").join(filename));
+    candidates.push(PathBuf::from("..").join("models").join(filename));
+    candidates.push(PathBuf::from("..").join("Wispr_rust").join("models").join(filename));
+    candidates.push(PathBuf::from("..").join("wispr_py").join("models").join(filename));
+
+    // 3. Known repo workspace path
+    candidates.push(PathBuf::from(r"E:\Programming\wispr\Wispr_rust\models").join(filename));
+    candidates.push(PathBuf::from(r"E:\Programming\wispr\wispr_py\models").join(filename));
 
     for c in &candidates {
         if c.exists() {
-            return c.clone();
+            return normalize_path(c.clone());
         }
     }
 
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let p1 = dir.join(filename);
-            if p1.exists() {
-                return p1;
-            }
-            let p2 = dir.join("models").join(filename);
-            if p2.exists() {
-                return p2;
-            }
+            return normalize_path(dir.join("models").join(filename));
         }
     }
 
-    PathBuf::from("models").join(filename)
+    normalize_path(PathBuf::from("models").join(filename))
 }
 
 struct WordRule {
@@ -194,15 +225,26 @@ impl CustomDictionary {
     pub fn reload(&self) {
         let mut words_map: HashMap<String, String> = HashMap::new();
 
-        let possible_paths = [
-            PathBuf::from("words.json"),
-            PathBuf::from("..").join("wispr_py").join("words.json"),
-        ];
+        let mut candidates = Vec::new();
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                candidates.push(dir.join("words.json"));
+                candidates.push(dir.join("..").join("words.json"));
+                candidates.push(dir.join("..").join("..").join("words.json"));
+                candidates.push(dir.join("..").join("wispr_py").join("words.json"));
+            }
+        }
+        candidates.push(PathBuf::from("words.json"));
+        candidates.push(PathBuf::from("Wispr_rust").join("words.json"));
+        candidates.push(PathBuf::from("wispr_py").join("words.json"));
+        candidates.push(PathBuf::from("..").join("wispr_py").join("words.json"));
+        candidates.push(PathBuf::from(r"E:\Programming\wispr\wispr_py\words.json"));
 
-        for path in &possible_paths {
+        for path in &candidates {
             if path.exists() {
                 if let Ok(content) = fs::read_to_string(path) {
                     if let Ok(parsed) = serde_json::from_str::<HashMap<String, String>>(&content) {
+                        log::info!("Loaded {} custom word replacements from {:?}", parsed.len(), path);
                         words_map = parsed;
                         break;
                     }

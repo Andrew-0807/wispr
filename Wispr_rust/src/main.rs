@@ -31,30 +31,38 @@ use crate::stt::WhisperEngine;
 use crate::tray::{TrayCallbacks, TrayManager};
 
 struct SingleInstanceGuard {
-    handle: HANDLE,
+    handle: Option<HANDLE>,
 }
 
 impl SingleInstanceGuard {
-    fn acquire() -> Option<Self> {
+    fn acquire() -> Result<Self, ()> {
         unsafe {
-            let handle = CreateMutexW(None, true, w!("Global\\WisprRustSingleInstanceMutex"));
-            if handle.is_err() {
-                return None;
+            let handle = CreateMutexW(None, true, w!("Local\\WisprRustSingleInstanceMutex"));
+            match handle {
+                Ok(h) => {
+                    if GetLastError() == ERROR_ALREADY_EXISTS {
+                        let _ = CloseHandle(h);
+                        log::warn!("Wispr is already running. Exiting duplicate instance.");
+                        Err(())
+                    } else {
+                        Ok(Self { handle: Some(h) })
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Could not create single-instance mutex: {:?}. Proceeding anyway.", e);
+                    Ok(Self { handle: None })
+                }
             }
-            let h = handle.unwrap();
-            if GetLastError() == ERROR_ALREADY_EXISTS {
-                let _ = CloseHandle(h);
-                return None;
-            }
-            Some(Self { handle: h })
         }
     }
 }
 
 impl Drop for SingleInstanceGuard {
     fn drop(&mut self) {
-        unsafe {
-            let _ = CloseHandle(self.handle);
+        if let Some(h) = self.handle.take() {
+            unsafe {
+                let _ = CloseHandle(h);
+            }
         }
     }
 }
@@ -85,9 +93,8 @@ async fn main() -> anyhow::Result<()> {
     log::info!("=========================================");
 
     let _single_instance = match SingleInstanceGuard::acquire() {
-        Some(guard) => guard,
-        None => {
-            log::warn!("Wispr is already running. Exiting duplicate instance.");
+        Ok(guard) => guard,
+        Err(()) => {
             std::process::exit(0);
         }
     };
@@ -199,7 +206,7 @@ async fn main() -> anyhow::Result<()> {
     let (event_tx, event_rx) = channel::<HookEvent>();
     let _hook_manager = KeyboardHookManager::start(event_tx)?;
 
-    log::info!("Wispr Rust is running. Hold [Ctrl + Win] for English or [Shift + Win] for Romanian dictation.");
+    log::info!("Wispr Rust is running. Hold [Ctrl + Win] or [Win + Space] for English, or [Shift + Win] for Romanian dictation.");
 
     // 9. Main Event Handling Loop
     while is_running.load(Ordering::Relaxed) {
